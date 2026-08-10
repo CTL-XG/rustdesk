@@ -208,6 +208,17 @@ pub(crate) fn active_uid() -> Option<u32> {
     active_uid_strict()
 }
 
+/// The active session uid read ONLY from the service-loop cache, never from a fresh (blocking) seat0
+/// lookup. `None` on a cache miss. For hot, latency-sensitive, fail-closed re-auth on an async runtime
+/// thread (the `_drm` per-frame re-auth), where a blocking `loginctl` per frame would stall the stream.
+// Gated with the feature, not just the OS: the `_drm` per-frame re-auth is its only caller, so a
+// drm-off Linux build would carry it as dead code and warn about it.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+#[inline]
+pub(crate) fn active_uid_cached() -> Option<u32> {
+    crate::platform::linux::get_active_userid_cached()
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[inline]
 pub(crate) fn peer_uid_from_fd(fd: RawFd) -> Option<u32> {
@@ -607,27 +618,30 @@ pub(crate) fn log_rejected_windows_ipc_connection(
     peer_session_id: Option<u32>,
     expected_session_id: Option<u32>,
     peer_is_system: Option<bool>,
+    peer_is_elevated: Option<bool>,
 ) {
     static LOG_THROTTLE: OnceLock<Mutex<UnauthorizedIpcLogThrottle>> = OnceLock::new();
     throttled_unauthorized_ipc_log(&LOG_THROTTLE, |suppressed| {
         if suppressed > 0 {
             log::warn!(
-                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?} (suppressed {} similar events)",
+                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}, peer_is_elevated={:?} (suppressed {} similar events)",
                 postfix,
                 peer_pid,
                 peer_session_id,
                 expected_session_id,
                 peer_is_system,
+                peer_is_elevated,
                 suppressed
             );
         } else {
             log::warn!(
-                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}",
+                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}, peer_is_elevated={:?}",
                 postfix,
                 peer_pid,
                 peer_session_id,
                 expected_session_id,
-                peer_is_system
+                peer_is_system,
+                peer_is_elevated
             );
         }
     });
@@ -653,10 +667,42 @@ pub(crate) fn authorize_service_scoped_ipc_connection(stream: &Connection, postf
     true
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn authorize_user_server_process(
+    peer_uid: Option<u32>,
+    peer_pid: Option<u32>,
+    expected_uid: u32,
+) -> bool {
+    if peer_uid != Some(expected_uid) {
+        return false;
+    }
+    let Some(peer_pid) = peer_pid else {
+        return false;
+    };
+    let Ok(peer_exe) = peer_exe_canonical_path_by_pid(peer_pid) else {
+        return false;
+    };
+    let expected_path = PathBuf::from(format!(
+        "/Applications/{}.app/Contents/MacOS/{}",
+        crate::get_app_name(),
+        crate::get_app_name()
+    ));
+    let Ok(expected_path) = fs::canonicalize(expected_path) else {
+        return false;
+    };
+    paths_refer_to_same_file(&peer_exe, &expected_path)
+}
+
 #[cfg(windows)]
 pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix: &str) -> bool {
-    let (authorized, peer_pid, peer_session_id, server_session_id, peer_is_system) =
-        stream.server_authorization_status();
+    let (
+        authorized,
+        peer_pid,
+        peer_session_id,
+        server_session_id,
+        peer_is_system,
+        peer_is_elevated,
+    ) = stream.server_authorization_status();
     if !authorized {
         log_rejected_windows_ipc_connection(
             postfix,
@@ -664,6 +710,7 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
             peer_session_id,
             server_session_id,
             peer_is_system,
+            peer_is_elevated,
         );
         return false;
     }
@@ -776,7 +823,14 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
 
     fn server_authorization_status(
         &self,
-    ) -> (bool, Option<u32>, Option<u32>, Option<u32>, Option<bool>) {
+    ) -> (
+        bool,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<bool>,
+        Option<bool>,
+    ) {
         let peer_pid = self.peer_pid();
         let server_session_id = crate::platform::windows::get_current_process_session_id();
         let peer_session_id =
@@ -786,24 +840,45 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
         let peer_is_system = peer_is_system_result
             .as_ref()
             .and_then(|r| r.as_ref().ok().copied());
-        if server_session_id.is_none() && !peer_is_system.unwrap_or(false) {
-            // When the server session id cannot be determined, the session-id allow-path is
-            // disabled and only SYSTEM peers can be authorized.
-            log::debug!(
-                "IPC authorization: server session id unavailable; rejecting non-SYSTEM peer, peer_pid={:?}, peer_session_id={:?}",
-                peer_pid,
-                peer_session_id
-            );
-        }
-        let authorized = is_allowed_windows_session_scoped_peer(
+        let session_authorized = is_allowed_windows_session_scoped_peer(
             peer_is_system.unwrap_or(false),
             peer_session_id,
             server_session_id,
         );
+        let peer_is_elevated_result = if session_authorized {
+            None
+        } else {
+            peer_pid.map(|pid| crate::platform::windows::is_elevated(Some(pid)))
+        };
+        let peer_is_elevated = peer_is_elevated_result
+            .as_ref()
+            .and_then(|r| r.as_ref().ok().copied());
+        if server_session_id.is_none()
+            && !peer_is_system.unwrap_or(false)
+            && !peer_is_elevated.unwrap_or(false)
+        {
+            // When the server session id cannot be determined, the session-id allow-path is
+            // disabled and only privileged peers can be authorized.
+            log::debug!(
+                "IPC authorization: server session id unavailable; rejecting non-privileged peer, peer_pid={:?}, peer_session_id={:?}",
+                peer_pid,
+                peer_session_id
+            );
+        }
+        // Main IPC trusts same-session peers, LocalSystem, and elevated administrators.
+        // Service-scoped IPC channels keep their own stricter authorization paths.
+        let authorized = session_authorized || peer_is_elevated.unwrap_or(false);
         if !authorized {
             if let (Some(pid), Some(Err(err))) = (peer_pid, peer_is_system_result.as_ref()) {
                 log::debug!(
                     "Failed to determine whether peer process is SYSTEM, pid={}, err={}",
+                    pid,
+                    err
+                );
+            }
+            if let (Some(pid), Some(Err(err))) = (peer_pid, peer_is_elevated_result.as_ref()) {
+                log::debug!(
+                    "Failed to determine whether peer process is elevated, pid={}, err={}",
                     pid,
                     err
                 );
@@ -815,6 +890,7 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
             peer_session_id,
             server_session_id,
             peer_is_system,
+            peer_is_elevated,
         )
     }
 

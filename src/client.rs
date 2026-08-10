@@ -96,6 +96,8 @@ pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
+// Empirical restart reconnect grace window.
+const RESTART_REMOTE_DEVICE_GRACE: Duration = Duration::from_secs(5 * 60);
 pub const VIDEO_QUEUE_SIZE: usize = 120;
 const MAX_DECODE_FAIL_COUNTER: usize = 3;
 
@@ -424,8 +426,8 @@ impl Client {
             NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
         };
 
-        if !key.is_empty() && !token.is_empty() {
-            // mainly for the security of token
+        let switch_code = interface.get_switch_code();
+        if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
             secure_tcp(&mut socket, &key)
                 .await
                 .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
@@ -467,6 +469,7 @@ impl Client {
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
+            switch_code,
             ..Default::default()
         });
         for i in 1..=3 {
@@ -714,6 +717,7 @@ impl Client {
         let mut direct = !conn.is_err();
         if interface.is_force_relay() || conn.is_err() {
             if !relay_server.is_empty() {
+                let switch_code = interface.get_switch_code();
                 conn = Self::request_relay(
                     peer_id,
                     relay_server.to_owned(),
@@ -722,6 +726,7 @@ impl Client {
                     key,
                     token,
                     conn_type,
+                    &switch_code,
                 )
                 .await;
                 if let Err(e) = conn {
@@ -842,6 +847,7 @@ impl Client {
         key: &str,
         token: &str,
         conn_type: ConnType,
+        switch_code: &str,
     ) -> ResultType<Stream> {
         let mut succeed = false;
         let mut uuid = "".to_owned();
@@ -853,8 +859,7 @@ impl Client {
                 .await
                 .with_context(|| "Failed to connect to rendezvous server")?;
 
-            if !key.is_empty() && !token.is_empty() {
-                // mainly for the security of token
+            if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
                 secure_tcp(&mut socket, key).await?;
             }
 
@@ -875,6 +880,7 @@ impl Client {
                 uuid: uuid.clone(),
                 relay_server: relay_server.clone(),
                 secure,
+                switch_code: switch_code.to_owned(),
                 ..Default::default()
             });
             socket.send(&msg_out).await?;
@@ -939,20 +945,22 @@ impl Client {
 
     #[cfg(not(target_os = "ios"))]
     fn try_stop_clipboard() {
-        // There's a bug here.
-        // If session is closed by the peer, `has_sessions_running()` will always return true.
-        // It's better to check if the active session number.
-        // But it's not a problem, because the clipboard thread does not consume CPU.
-        //
-        // If we want to fix it, we can add a flag to indicate if session is active.
-        // But I think it's not necessary to introduce complexity at this point.
+        // Disconnected Flutter sessions may keep UI handlers alive, so only connected sessions
+        // should block clipboard cleanup.
         #[cfg(feature = "flutter")]
-        if crate::flutter::sessions::has_sessions_running(ConnType::DEFAULT_CONN) {
+        if crate::flutter::sessions::has_connected_sessions_running(ConnType::DEFAULT_CONN) {
             return;
         }
         #[cfg(not(target_os = "android"))]
         clipboard_listener::unsubscribe(Self::CLIENT_CLIPBOARD_NAME);
         CLIPBOARD_STATE.lock().unwrap().running = false;
+        #[cfg(all(feature = "unix-file-copy-paste", target_os = "linux"))]
+        if let Err(e) = crate::clipboard::try_empty_clipboard_files_sync(
+            crate::clipboard::ClipboardSide::Client,
+            0,
+        ) {
+            log::error!("Failed to empty client clipboard files: {}", e);
+        }
         #[cfg(all(feature = "unix-file-copy-paste", target_os = "linux"))]
         clipboard::platform::unix::fuse::uninit_fuse_context(true);
     }
@@ -1397,6 +1405,10 @@ impl AudioHandler {
 
     /// Handle audio format and create an audio decoder.
     pub fn handle_format(&mut self, f: AudioFormat) {
+        if !is_supported_audio_channel_count(f.channels) {
+            log::error!("Unsupported audio channel count: {}", f.channels);
+            return;
+        }
         match AudioDecoder::new(f.sample_rate, if f.channels > 1 { Stereo } else { Mono }) {
             Ok(d) => {
                 let buffer = vec![0.; f.sample_rate as usize * f.channels as usize];
@@ -1533,6 +1545,23 @@ impl AudioHandler {
         stream.play()?;
         self.audio_stream = Some(Box::new(stream));
         Ok(())
+    }
+}
+
+fn is_supported_audio_channel_count(channels: u32) -> bool {
+    (1..=2).contains(&channels)
+}
+
+#[cfg(test)]
+mod audio_format_tests {
+    use super::is_supported_audio_channel_count;
+
+    #[test]
+    fn only_mono_and_stereo_are_supported() {
+        assert!(is_supported_audio_channel_count(1));
+        assert!(is_supported_audio_channel_count(2));
+        assert!(!is_supported_audio_channel_count(0));
+        assert!(!is_supported_audio_channel_count(u32::MAX));
     }
 }
 
@@ -1740,7 +1769,10 @@ pub struct LoginConfigHandler {
     features: Option<Features>,
     pub session_id: u64, // used for local <-> server communication
     pub supported_encoding: SupportedEncoding,
-    pub restarting_remote_device: bool,
+    restarting_remote_device: bool,
+    // Start time of the restart grace window. On Windows the peer may briefly
+    // reconnect before the real reboot disconnect.
+    restart_remote_device_at: Option<Instant>,
     pub force_relay: bool,
     pub direct: Option<bool>,
     pub received: bool,
@@ -1849,7 +1881,7 @@ impl LoginConfigHandler {
         }
         self.session_id = sid;
         self.supported_encoding = Default::default();
-        self.restarting_remote_device = false;
+        self.clear_restarting_remote_device();
         self.force_relay =
             config::option2bool("force-always-relay", &self.get_option("force-always-relay"))
                 || force_relay
@@ -2643,9 +2675,6 @@ impl LoginConfigHandler {
         os_password: String,
         password: Vec<u8>,
     ) -> Message {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let my_id = Config::get_id_or(crate::DEVICE_ID.lock().unwrap().clone());
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let my_id = Config::get_id();
         let (my_id, pure_id) = if let Some((id, _, _)) = self.other_server.as_ref() {
             let server = Config::get_rendezvous_server();
@@ -2777,6 +2806,30 @@ impl LoginConfigHandler {
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         msg_out
+    }
+
+    pub fn mark_restarting_remote_device(&mut self) {
+        self.restarting_remote_device = true;
+        self.restart_remote_device_at = Some(Instant::now());
+    }
+
+    pub fn clear_restarting_remote_device(&mut self) {
+        self.restarting_remote_device = false;
+        self.restart_remote_device_at = None;
+    }
+
+    pub fn is_restarting_remote_device(&self) -> bool {
+        if !self.restarting_remote_device {
+            return false;
+        }
+        // Keep this flag alive for a short grace window instead of clearing it on
+        // connection_ready or the first peer bytes. During OS restart the peer can
+        // briefly reconnect before the real reboot disconnect, and clearing it too
+        // early would let the next disconnect escape the restart flow and fall back
+        // to the normal error dialog / manual reconnect path.
+        self.restart_remote_device_at
+            .map(|started_at| started_at.elapsed() < RESTART_REMOTE_DEVICE_GRACE)
+            .unwrap_or(false)
     }
 
     pub fn get_conn_token(&self) -> Option<String> {
@@ -3705,6 +3758,16 @@ pub trait Interface: Send + Clone + 'static + Sized {
         self.get_lch().read().unwrap().force_relay
     }
 
+    fn get_switch_code(&self) -> String {
+        match self.get_lch().read().unwrap().switch_uuid.clone() {
+            Some(u) if !u.is_empty() => {
+                use hbb_common::sodiumoxide::crypto::hash::sha256;
+                crate::encode64(sha256::hash(u.as_bytes()).0)
+            }
+            _ => String::new(),
+        }
+    }
+
     fn swap_modifier_mouse(&self, _msg: &mut hbb_common::protos::message::MouseEvent) {}
 
     fn update_direct(&self, direct: Option<bool>) {
@@ -3718,9 +3781,18 @@ pub trait Interface: Send + Clone + 'static + Sized {
     fn on_establish_connection_error(&self, err: String) {
         let title = "Connection Error";
         let text = err.to_string();
-        let lc = self.get_lch();
-        let direct = lc.read().unwrap().direct;
-        let received = lc.read().unwrap().received;
+        let lch = self.get_lch();
+        let (is_restarting, direct, received) = {
+            let lc = lch.read().unwrap();
+            (lc.is_restarting_remote_device(), lc.direct, lc.received)
+        };
+        if is_restarting {
+            log::info!("Restart remote device, suppress connection error: {err}");
+            // Flutter treats this as a reconnect control event. The text is kept
+            // for legacy UI and existing translation reuse.
+            self.msgbox("restarting", "Restarting remote device", "Connection in progress. Please wait.", "");
+            return;
+        }
 
         let mut relay_hint = false;
         let mut relay_hint_type = "relay-hint";
@@ -3752,6 +3824,7 @@ pub trait Interface: Send + Clone + 'static + Sized {
 #[derive(Clone)]
 pub enum Data {
     Close,
+    RejectInsecureConnection,
     Login((String, String, String, bool)),
     Message(Message),
     SendFiles((i32, JobType, String, String, i32, bool, bool)),
@@ -3775,9 +3848,31 @@ pub enum Data {
     ElevateWithLogon(String, String),
     NewVoiceCall,
     CloseVoiceCall,
+    ContinueInsecureConnection,
     ResetDecoder(Option<usize>),
     RenameFile((i32, String, String, bool)),
     TakeScreenshot((i32, String)),
+}
+
+pub async fn confirm_insecure_connection(
+    interface: &impl Interface,
+    receiver: &mut UnboundedReceiver<Data>,
+) -> bool {
+    interface.msgbox(
+        "insecure-connection-nocancel-hasclose",
+        "Insecure Connection",
+        "conn-e2ee-unavailable-tip",
+        "",
+    );
+    while let Some(data) = receiver.recv().await {
+        match data {
+            Data::ContinueInsecureConnection => return true,
+            Data::RejectInsecureConnection => return false,
+            Data::Close => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Keycode for key events.

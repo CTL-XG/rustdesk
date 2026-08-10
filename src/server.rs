@@ -44,6 +44,8 @@ mod clipboard_service;
 pub use clipboard_service::is_clipboard_service_ok;
 #[cfg(target_os = "linux")]
 pub(crate) mod wayland;
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) mod drm_capturer;
 #[cfg(target_os = "linux")]
 pub mod uinput;
 #[cfg(target_os = "linux")]
@@ -80,6 +82,12 @@ pub mod printer_service;
 
 pub type Childs = Arc<Mutex<Vec<std::process::Child>>>;
 type ConnMap = HashMap<i32, ConnInner>;
+
+#[derive(Clone, Default)]
+pub struct ConnectionMeta {
+    pub control_permissions: Option<ControlPermissions>,
+    pub controlled_context: Option<ControlledContext>,
+}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const CONFIG_SYNC_INTERVAL_SECS: f32 = 0.3;
@@ -163,7 +171,7 @@ async fn accept_connection_(
     server: ServerPtr,
     socket: Stream,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     let local_addr = socket.local_addr();
     drop(socket);
@@ -180,7 +188,7 @@ async fn accept_connection_(
             Stream::from(stream, stream_addr),
             addr,
             secure,
-            control_permissions,
+            meta,
         )
         .await?;
     }
@@ -192,7 +200,7 @@ pub async fn create_tcp_connection(
     stream: Stream,
     addr: SocketAddr,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     let mut stream = stream;
     let id = server.write().unwrap().get_new_id();
@@ -260,14 +268,7 @@ pub async fn create_tcp_connection(
         }
         log::info!("wake up macos");
     }
-    Connection::start(
-        addr,
-        stream,
-        id,
-        Arc::downgrade(&server),
-        control_permissions,
-    )
-    .await;
+    Connection::start(addr, stream, id, Arc::downgrade(&server), meta).await;
     Ok(())
 }
 
@@ -276,9 +277,9 @@ pub async fn accept_connection(
     socket: Stream,
     peer_addr: SocketAddr,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) {
-    if let Err(err) = accept_connection_(server, socket, secure, control_permissions).await {
+    if let Err(err) = accept_connection_(server, socket, secure, meta).await {
         log::warn!("Failed to accept connection from {}: {}", peer_addr, err);
     }
 }
@@ -290,7 +291,7 @@ pub async fn create_relay_connection(
     peer_addr: SocketAddr,
     secure: bool,
     ipv4: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) {
     if let Err(err) = create_relay_connection_(
         server,
@@ -299,7 +300,7 @@ pub async fn create_relay_connection(
         peer_addr,
         secure,
         ipv4,
-        control_permissions,
+        meta,
     )
     .await
     {
@@ -319,7 +320,7 @@ async fn create_relay_connection_(
     peer_addr: SocketAddr,
     secure: bool,
     ipv4: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
@@ -334,7 +335,7 @@ async fn create_relay_connection_(
         ..Default::default()
     });
     stream.send(&msg_out).await?;
-    create_tcp_connection(server, stream, peer_addr, secure, control_permissions).await?;
+    create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
     Ok(())
 }
 
@@ -358,15 +359,13 @@ impl Server {
         }
     }
 
-    pub fn try_add_primay_video_service(&mut self) {
-        let primary_video_service_name = video_service::get_service_name(
-            VideoSource::Monitor,
-            *display_service::PRIMARY_DISPLAY_IDX,
-        );
-        if !self.contains(&primary_video_service_name) {
+    pub fn try_add_monitor_service(&mut self, display_idx: usize) {
+        let monitor_service_name =
+            video_service::get_service_name(VideoSource::Monitor, display_idx);
+        if !self.contains(&monitor_service_name) {
             self.add_service(Box::new(video_service::new(
                 VideoSource::Monitor,
-                *display_service::PRIMARY_DISPLAY_IDX,
+                display_idx,
             )));
         }
     }
@@ -382,14 +381,17 @@ impl Server {
         self.connections.insert(conn.id(), conn);
     }
 
-    pub fn add_connection(&mut self, conn: ConnInner, noperms: &Vec<&'static str>) {
-        let primary_video_service_name = video_service::get_service_name(
-            VideoSource::Monitor,
-            *display_service::PRIMARY_DISPLAY_IDX,
-        );
+    pub fn add_monitor_connection(
+        &mut self,
+        conn: ConnInner,
+        noperms: &Vec<&'static str>,
+        display_idx: usize,
+    ) {
+        let monitor_service_name =
+            video_service::get_service_name(VideoSource::Monitor, display_idx);
         for s in self.services.values() {
             let name = s.name();
-            if Self::is_video_service_name(&name) && name != primary_video_service_name {
+            if Self::is_video_service_name(&name) && name != monitor_service_name {
                 continue;
             }
             if !noperms.contains(&(&name as _)) {
@@ -599,6 +601,25 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                 std::process::exit(-1);
             }
         });
+        // Warm the DRM availability cache before any client connects, so the first connection does
+        // not race a cold `_drm` probe and ship an empty display list ("No displays" + retry).
+        // X11 is skipped -- probing there makes the root service open DRM readers for a path this
+        // session can never take -- but that decision belongs to `warm_availability`, which already
+        // makes it, and NOT to this call site. Deciding it here is the same one-shot-at-startup
+        // mistake the pre-warm had: `is_x11()` answers "x11" whenever loginctl cannot yet name the
+        // seat0 session, which during a boot is exactly when this runs, and nothing revisits it --
+        // so a Wayland host that came up slowly skipped the warm for the life of the process and
+        // got back the cold-probe "No displays" symptom the warm exists to remove.
+        #[cfg(all(target_os = "linux", feature = "drm"))]
+        if let Err(err) = std::thread::Builder::new()
+            .name("drm-warm".into())
+            .spawn(drm_capturer::warm_availability)
+        {
+            // Same reason as the root service's startup threads: `thread::spawn` panics on EAGAIN
+            // and that would abort `start_server`. Skipping the warm costs the first session the
+            // cold probe, which is what happened before the warm existed.
+            log::warn!("drm: could not spawn the availability warm ({err}); skipping it");
+        }
         input_service::fix_key_down_timeout_loop();
         #[cfg(target_os = "linux")]
         if input_service::wayland_use_uinput() {
@@ -784,8 +805,7 @@ async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Se
                 loop {
                     sleep(CONFIG_SYNC_INTERVAL_SECS).await;
                     let cfg = (Config::get(), Config2::get());
-                    let should_sync =
-                        cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
+                    let should_sync = cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
                     if should_sync {
                         if is_root_config_empty {
                             log::info!("root config is empty, sync our config to root");
